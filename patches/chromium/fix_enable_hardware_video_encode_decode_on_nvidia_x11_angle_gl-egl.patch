@@ -1,0 +1,431 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jung-Kang Lee <ntoskrnl7@gmail.com>
+Date: Wed, 18 Mar 2026 07:18:22 +0900
+Subject: fix: enable hardware video encode/decode on NVIDIA X11 ANGLE GL-EGL
+
+- use SkiaOutputDeviceX11 for the X11 ANGLE OpenGL output path
+- choose EGL configs that match the actual X11 window visual/depth
+- preserve NV12/P010 native pixmap import capability after recomputing gpu feature info
+- enable NVIDIA VAAPI/native pixmap paths needed by the media pipeline
+
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 1b51c0f1ebf94cccbb428a1c77f3a910d2dc2a67..dffd76262bd95c4960c5d107033c097246f11a99 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -123,11 +123,12 @@
+ #include "ui/ozone/public/surface_factory_ozone.h"
+ #endif
+ 
+-#if (BUILDFLAG(ENABLE_VULKAN) || BUILDFLAG(SKIA_USE_DAWN)) && \
+-    BUILDFLAG(SUPPORTS_OZONE_X11)
++#if BUILDFLAG(SUPPORTS_OZONE_X11)
+ #include "components/viz/service/display_embedder/skia_output_device_x11.h"
+ #endif
+ 
++#include "ui/gl/gl_implementation.h"
++
+ #if BUILDFLAG(SKIA_USE_DAWN) && (BUILDFLAG(IS_WIN) || BUILDFLAG(IS_ANDROID))
+ #include "components/viz/service/display_embedder/skia_output_device_dawn.h"
+ #endif
+@@ -179,7 +180,6 @@ void RecordInsertRenderPassRecording(bool success) {
+   }
+ }
+ 
+-#if BUILDFLAG(ENABLE_VULKAN)
+ // Returns whether SkiaOutputDeviceX11 can be instantiated on this platform.
+ bool MayFallBackToSkiaOutputDeviceX11() {
+ #if BUILDFLAG(IS_OZONE)
+@@ -190,8 +190,25 @@ bool MayFallBackToSkiaOutputDeviceX11() {
+   return false;
+ #endif  // BUILDFLAG(IS_OZONE)
+ }
+-#endif  // BUILDFLAG(ENABLE_VULKAN)
+ 
++#if BUILDFLAG(SUPPORTS_OZONE_X11)
++bool ShouldUseSkiaOutputDeviceX11ForGL(
++    SkiaOutputSurfaceDependency* dependency,
++    bool has_presenter) {
++
++  if (has_presenter || !MayFallBackToSkiaOutputDeviceX11()) {
++    return false;
++  }
++
++  if (dependency->GetSurfaceHandle() == gpu::kNullSurfaceHandle ||
++      dependency->NeedsSupportForExternalStencil()) {
++    return false;
++  }
++
++  return gl::GetGLImplementationParts() ==
++         gl::GLImplementationParts(gl::ANGLEImplementation::kOpenGL);
++}
++#endif
+ }  // namespace
+ 
+ SkiaOutputSurfaceImplOnGpu::PromiseImageAccessHelper::PromiseImageAccessHelper(
+@@ -2015,6 +2032,19 @@ bool SkiaOutputSurfaceImplOnGpu::InitializeForGL() {
+               context_state_.get(), gl_surface_,
+               shared_gpu_deps_->memory_tracker(),
+               GetDidSwapBuffersCompleteCallback());
++#if BUILDFLAG(SUPPORTS_OZONE_X11)
++        } else if (ShouldUseSkiaOutputDeviceX11ForGL(dependency_, presenter_)) {
++          output_device_ = SkiaOutputDeviceX11::Create(
++              context_state_, dependency_->GetSurfaceHandle(),
++              shared_gpu_deps_->memory_tracker(),
++              GetDidSwapBuffersCompleteCallback());
++          if (!output_device_) {
++            output_device_ = std::make_unique<SkiaOutputDeviceGL>(
++                context_state_.get(), gl_surface_, feature_info_,
++                shared_gpu_deps_->memory_tracker(),
++                GetDidSwapBuffersCompleteCallback());
++          }
++#endif
+         } else {
+           // Used by Android, Linux, and Windows (when DComp has been disabled).
+           output_device_ = std::make_unique<SkiaOutputDeviceGL>(
+diff --git a/gpu/ipc/service/gpu_init.cc b/gpu/ipc/service/gpu_init.cc
+index 05c976f1f037e45e963e20e2b4272339b1819350..6e71d9606415d7b26b1745ab713588af27d8fd01 100644
+--- a/gpu/ipc/service/gpu_init.cc
++++ b/gpu/ipc/service/gpu_init.cc
+@@ -806,23 +806,6 @@ bool GpuInit::InitializeAndStartSandbox(base::CommandLine* command_line,
+     }
+   }
+ 
+-#if BUILDFLAG(IS_OZONE)
+-  // We need to get supported formats before sandboxing to avoid an known
+-  // issue which breaks the camera preview. (b/166850715)
+-  {
+-    TRACE_EVENT("gpu,startup", "ui::ozone::IsFormatSupportedForTexturing");
+-    auto* surface_factory =
+-        ui::OzonePlatform::GetInstance()->GetSurfaceFactoryOzone();
+-    auto* gl_ozone = surface_factory->GetCurrentGLOzone();
+-    if (gl_ozone) {
+-      gpu_feature_info_.supports_nv12_gl_native_pixmap =
+-          gl_ozone->CanImportNativePixmap(viz::MultiPlaneFormat::kNV12);
+-      gpu_feature_info_.supports_p010_gl_native_pixmap =
+-          gl_ozone->CanImportNativePixmap(viz::MultiPlaneFormat::kP010);
+-    }
+-  }
+-#endif  // BUILDFLAG(IS_OZONE)
+-
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+   // Driver may create a compatibility profile context when collect graphics
+   // information on Linux platform. Try to collect graphics information
+@@ -845,6 +828,23 @@ bool GpuInit::InitializeAndStartSandbox(base::CommandLine* command_line,
+   }
+ #endif  // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+ 
++#if BUILDFLAG(IS_OZONE)
++  // We need to get supported formats before sandboxing to avoid an known
++  // issue which breaks the camera preview. (b/166850715)
++  {
++    TRACE_EVENT("gpu,startup", "ui::ozone::IsFormatSupportedForTexturing");
++    auto* surface_factory =
++        ui::OzonePlatform::GetInstance()->GetSurfaceFactoryOzone();
++    auto* gl_ozone = surface_factory->GetCurrentGLOzone();
++    if (gl_ozone) {
++      gpu_feature_info_.supports_nv12_gl_native_pixmap =
++          gl_ozone->CanImportNativePixmap(viz::MultiPlaneFormat::kNV12);
++      gpu_feature_info_.supports_p010_gl_native_pixmap =
++          gl_ozone->CanImportNativePixmap(viz::MultiPlaneFormat::kP010);
++    }
++  }
++#endif  // BUILDFLAG(IS_OZONE)
++
+   if (gl_use_swiftshader_) {
+     AdjustInfoToSwiftShader();
+   }
+diff --git a/media/gpu/vaapi/vaapi_wrapper.cc b/media/gpu/vaapi/vaapi_wrapper.cc
+index 4c220c3385e9eddb17e3d8281e5d546ab4fc6c6b..b0e16d511f36a08403eada4d85984359d6e779c8 100644
+--- a/media/gpu/vaapi/vaapi_wrapper.cc
++++ b/media/gpu/vaapi/vaapi_wrapper.cc
+@@ -385,6 +385,13 @@ media::VAImplementation VendorStringToImplementationType(
+   } else if (base::StartsWith(va_vendor_string, "Intel iHD driver",
+                               base::CompareCase::SENSITIVE)) {
+     return media::VAImplementation::kIntelIHD;
++  // The NVIDIA VA-API backend appears as either:
++  // - "VA-API NVDEC driver" (official)
++  // - "VA-API NVDEC/NVENC driver" (custom builds with NVENC support)
++  // Match the common NVDEC prefix so both map to kNvidia.
++  } else if (base::StartsWith(va_vendor_string, "VA-API NVDEC",
++                              base::CompareCase::SENSITIVE)) {
++    return media::VAImplementation::kNvidia;
+   } else if (base::StartsWith(va_vendor_string, "Chromium fake libva driver",
+                               base::CompareCase::SENSITIVE)) {
+     return media::VAImplementation::kChromiumFakeDriver;
+@@ -2450,6 +2457,7 @@ std::unique_ptr<ScopedVASurface> VaapiWrapper::CreateVASurfaceForPixmap(
+   // plumbed for JPEG decoding and encoding.
+   const bool use_drm_prime_2 =
+       (GetImplementationType() == VAImplementation::kIntelIHD ||
++       GetImplementationType() == VAImplementation::kNvidia ||
+        GetImplementationType() == VAImplementation::kChromiumFakeDriver ||
+        GetImplementationType() == VAImplementation::kMesaGallium) &&
+       !protected_content &&
+diff --git a/media/gpu/vaapi/vaapi_wrapper.h b/media/gpu/vaapi/vaapi_wrapper.h
+index 37001b947a9fa4355e42e99d527fb364bae8cb4b..a2be205da4f97458b791bd3d23bbf85cf7ae6d59 100644
+--- a/media/gpu/vaapi/vaapi_wrapper.h
++++ b/media/gpu/vaapi/vaapi_wrapper.h
+@@ -103,6 +103,7 @@ enum class VAImplementation {
+   kMesaGallium,
+   kIntelI965,
+   kIntelIHD,
++  kNvidia,
+   kChromiumFakeDriver,
+   kOther,
+   kInvalid,
+diff --git a/ui/gfx/linux/gbm_support_x11.cc b/ui/gfx/linux/gbm_support_x11.cc
+index 83362ba8948da4e91d003d85a58f59cfab7096a2..319ab980f33032eeae6e5ea33311730189e707a5 100644
+--- a/ui/gfx/linux/gbm_support_x11.cc
++++ b/ui/gfx/linux/gbm_support_x11.cc
+@@ -85,9 +85,14 @@ GBMSupportX11::CreateSupportedConfigList(ui::GbmDevice* device) {
+   for (gfx::BufferUsage usage : {
+            gfx::BufferUsage::GPU_READ,
+            gfx::BufferUsage::SCANOUT,
++           gfx::BufferUsage::SCANOUT_CAMERA_READ_WRITE,
++           gfx::BufferUsage::CAMERA_AND_CPU_READ_WRITE,
+            gfx::BufferUsage::SCANOUT_CPU_READ_WRITE,
+            gfx::BufferUsage::GPU_READ_CPU_READ_WRITE,
+            gfx::BufferUsage::SCANOUT_VDA_WRITE,
++           gfx::BufferUsage::SCANOUT_VEA_CPU_READ,
++           gfx::BufferUsage::VEA_READ_CAMERA_AND_CPU_READ_WRITE,
++           gfx::BufferUsage::SCANOUT_FRONT_RENDERING,
+        }) {
+     for (viz::SharedImageFormat format : {
+              viz::SinglePlaneFormat::kR_8,
+@@ -158,6 +163,12 @@ bool GBMSupportX11::CanCreateBufferForFormat(viz::SharedImageFormat format) {
+                         GetFourCCFormatFromSharedImageFormat(format));
+ }
+ 
++bool GBMSupportX11::IsConfigurationSupported(viz::SharedImageFormat format,
++                                             gfx::BufferUsage usage) const {
++  return std::ranges::contains(supported_configs_,
++                               BufferUsageAndSIFormat(usage, format));
++}
++
+ std::unique_ptr<GbmBuffer> GBMSupportX11::CreateBufferFromHandle(
+     const gfx::Size& size,
+     viz::SharedImageFormat format,
+diff --git a/ui/gfx/linux/gbm_support_x11.h b/ui/gfx/linux/gbm_support_x11.h
+index 1374de67f6fb8b1a6b8f02c2a9a82f502810e2f4..bc49c06afce8c51130c02dbc377198ee77de741f 100644
+--- a/ui/gfx/linux/gbm_support_x11.h
++++ b/ui/gfx/linux/gbm_support_x11.h
+@@ -33,6 +33,8 @@ class COMPONENT_EXPORT(GBM_SUPPORT_X11) GBMSupportX11 {
+                                           gfx::BufferUsage usage);
+ 
+   bool CanCreateBufferForFormat(viz::SharedImageFormat format);
++  bool IsConfigurationSupported(viz::SharedImageFormat format,
++                                gfx::BufferUsage usage) const;
+   std::unique_ptr<GbmBuffer> CreateBufferFromHandle(
+       const gfx::Size& size,
+       viz::SharedImageFormat format,
+diff --git a/ui/gfx/x/visual_manager.cc b/ui/gfx/x/visual_manager.cc
+index acf2392d9e821ee44653883b4efd6360b0aa29d1..1fcae9fa2d71a932f34d3feb9c9644f78a260091 100644
+--- a/ui/gfx/x/visual_manager.cc
++++ b/ui/gfx/x/visual_manager.cc
+@@ -93,8 +93,17 @@ void VisualManager::ChooseVisualForWindow(bool want_argb_visual,
+   if (visual_id) {
+     *visual_id = visual;
+   }
+-  bool success = GetVisualInfo(visual, depth, colormap, visual_has_alpha);
++  uint8_t chosen_depth = 0;
++  bool chosen_has_alpha = false;
++  bool success = GetVisualInfo(visual, &chosen_depth, colormap,
++                               &chosen_has_alpha);
+   DCHECK(success);
++  if (depth) {
++    *depth = chosen_depth;
++  }
++  if (visual_has_alpha) {
++    *visual_has_alpha = chosen_has_alpha;
++  }
+ }
+ 
+ bool VisualManager::GetVisualInfo(VisualId visual_id,
+diff --git a/ui/gl/gl_surface_egl_x11.cc b/ui/gl/gl_surface_egl_x11.cc
+index 3a6401b222fbe1a000cb9ef2d6780e297dc0db98..915ee574c3a4cfc67d95ac561675f817625b2a98 100644
+--- a/ui/gl/gl_surface_egl_x11.cc
++++ b/ui/gl/gl_surface_egl_x11.cc
+@@ -5,7 +5,10 @@
+ #include "ui/gl/gl_surface_egl_x11.h"
+ 
+ #include <algorithm>
++#include <array>
++#include <vector>
+ 
++#include "base/logging.h"
+ #include "ui/base/x/x11_util.h"
+ #include "ui/base/x/x11_xrandr_interval_only_vsync_provider.h"
+ #include "ui/gfx/frame_data.h"
+@@ -16,10 +19,114 @@
+ 
+ namespace gl {
+ 
++namespace {
++EGLConfig ChooseWindowConfig(EGLDisplay display,
++                             x11::VisualId visual_id,
++                             uint8_t depth) {
++  const std::array<EGLint, 2> renderable_types = {EGL_OPENGL_ES3_BIT,
++                                                  EGL_OPENGL_ES2_BIT};
++  const std::array<EGLint, 2> alpha_sizes = {
++      depth == 32 ? 8 : 0,
++      0,
++  };
++
++  for (EGLint renderable_type : renderable_types) {
++    for (EGLint alpha_size : alpha_sizes) {
++      if (depth != 32 && alpha_size != 0)
++        continue;
++
++      std::array<EGLint, 15> config_attribs = {
++          EGL_BUFFER_SIZE,  static_cast<EGLint>(depth),
++          EGL_ALPHA_SIZE,   alpha_size,
++          EGL_BLUE_SIZE,    8,
++          EGL_GREEN_SIZE,   8,
++          EGL_RED_SIZE,     8,
++          EGL_RENDERABLE_TYPE,
++          renderable_type,
++          EGL_SURFACE_TYPE,
++          EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
++          EGL_NONE,
++      };
++
++      EGLint num_configs = 0;
++      if (!eglChooseConfig(display, config_attribs.data(), nullptr, 0,
++                           &num_configs)) {
++        LOG(ERROR) << "eglChooseConfig failed with error "
++                   << ui::GetLastEGLErrorString();
++        return nullptr;
++      }
++      if (!num_configs)
++        continue;
++
++      std::vector<EGLConfig> configs(num_configs);
++      if (!eglChooseConfig(display, config_attribs.data(), configs.data(),
++                           num_configs, &num_configs)) {
++        LOG(ERROR) << "eglChooseConfig failed with error "
++                   << ui::GetLastEGLErrorString();
++        return nullptr;
++      }
++
++      for (EGLConfig config : configs) {
++        EGLint config_depth = 0;
++        EGLint config_visual_id = 0;
++        if (!eglGetConfigAttrib(display, config, EGL_BUFFER_SIZE,
++                                &config_depth) ||
++            !eglGetConfigAttrib(display, config, EGL_NATIVE_VISUAL_ID,
++                                &config_visual_id)) {
++          LOG(ERROR) << "eglGetConfigAttrib failed with error "
++                     << ui::GetLastEGLErrorString();
++          return nullptr;
++        }
++        if (config_depth == depth &&
++            config_visual_id == static_cast<EGLint>(visual_id)) {
++          return config;
++        }
++      }
++    }
++  }
++
++  return nullptr;
++}
++
++}  // namespace
++
+ NativeViewGLSurfaceEGLX11::NativeViewGLSurfaceEGLX11(GLDisplayEGL* display,
+                                                      x11::Window window)
+     : NativeViewGLSurfaceEGL(display, static_cast<uint32_t>(window), nullptr) {}
+ 
++EGLConfig NativeViewGLSurfaceEGLX11::GetConfig() {
++  if (config_)
++    return config_;
++
++  DCHECK(window_);
++  auto* connection = GetXNativeConnection();
++  auto window = static_cast<x11::Window>(window_);
++  auto attributes = connection->GetWindowAttributes(window).Sync();
++  if (!attributes) {
++    LOG(ERROR) << "GetWindowAttributes failed for window "
++               << static_cast<uint32_t>(window)
++               << "; falling back to generic EGL config selection.";
++    return NativeViewGLSurfaceEGL::GetConfig();
++  }
++
++  uint8_t depth = 0;
++  if (!connection->GetOrCreateVisualManager().GetVisualInfo(
++          attributes->visual, &depth, nullptr, nullptr)) {
++    LOG(ERROR) << "GetVisualInfo failed for visual "
++               << static_cast<uint32_t>(attributes->visual)
++               << "; falling back to generic EGL config selection.";
++    return NativeViewGLSurfaceEGL::GetConfig();
++  }
++
++  config_ = ChooseWindowConfig(display_->GetDisplay(), attributes->visual, depth);
++  if (!config_) {
++    LOG(ERROR) << "NativeViewGLSurfaceEGLX11::GetConfig failed for visual "
++               << static_cast<uint32_t>(attributes->visual)
++               << " depth " << static_cast<int>(depth) << ".";
++  }
++  return config_;
++}
++
+ bool NativeViewGLSurfaceEGLX11::Initialize(GLSurfaceFormat format) {
+   if (!NativeViewGLSurfaceEGL::Initialize(format))
+     return false;
+@@ -49,6 +156,14 @@ void NativeViewGLSurfaceEGLX11::Destroy() {
+     x11::Connection::Get()->RemoveEventObserver(this);
+ }
+ 
++bool NativeViewGLSurfaceEGLX11::Resize(const gfx::Size& size,
++                                       float scale_factor,
++                                       const gfx::ColorSpace& color_space,
++                                       bool has_alpha) {
++  return NativeViewGLSurfaceEGL::Resize(size, scale_factor, color_space,
++                                        has_alpha);
++}
++
+ gfx::SwapResult NativeViewGLSurfaceEGLX11::SwapBuffers(
+     PresentationCallback callback,
+     gfx::FrameData data) {
+@@ -72,6 +187,11 @@ gfx::SwapResult NativeViewGLSurfaceEGLX11::SwapBuffers(
+ }
+ 
+ EGLint NativeViewGLSurfaceEGLX11::GetNativeVisualID() const {
++  auto window = static_cast<x11::Window>(window_);
++  if (auto attributes = GetXNativeConnection()->GetWindowAttributes(window).Sync()) {
++    return static_cast<EGLint>(attributes->visual);
++  }
++
+   x11::VisualId visual_id;
+   GetXNativeConnection()->GetOrCreateVisualManager().ChooseVisualForWindow(
+       true, &visual_id, nullptr, nullptr, nullptr);
+diff --git a/ui/gl/gl_surface_egl_x11.h b/ui/gl/gl_surface_egl_x11.h
+index 0325e86d60fb64c9637d77b322b5b96a65264255..42efd180ff6d6790f85c1d0753b28f33a39f3a32 100644
+--- a/ui/gl/gl_surface_egl_x11.h
++++ b/ui/gl/gl_surface_egl_x11.h
+@@ -24,8 +24,13 @@ class GL_EXPORT NativeViewGLSurfaceEGLX11 : public NativeViewGLSurfaceEGL,
+       delete;
+ 
+   // NativeViewGLSurfaceEGL overrides.
++  EGLConfig GetConfig() override;
+   bool Initialize(GLSurfaceFormat format) override;
+   void Destroy() override;
++  bool Resize(const gfx::Size& size,
++              float scale_factor,
++              const gfx::ColorSpace& color_space,
++              bool has_alpha) override;
+   gfx::SwapResult SwapBuffers(PresentationCallback callback,
+                               gfx::FrameData data) override;
+   EGLint GetNativeVisualID() const override;
+diff --git a/ui/ozone/platform/x11/ozone_platform_x11.cc b/ui/ozone/platform/x11/ozone_platform_x11.cc
+index 71924ab2d033bf65dd6353f80827d702a6093520..c2b804ffb802bbc63489e487742892331d54ea8b 100644
+--- a/ui/ozone/platform/x11/ozone_platform_x11.cc
++++ b/ui/ozone/platform/x11/ozone_platform_x11.cc
+@@ -234,7 +234,8 @@ class OzonePlatformX11 : public OzonePlatform,
+ 
+   bool IsNativePixmapConfigSupported(viz::SharedImageFormat format,
+                                      gfx::BufferUsage usage) const override {
+-    return false;
++    return ui::GBMSupportX11::GetInstance()->IsConfigurationSupported(format,
++                                                                      usage);
+   }
+ 
+   bool IsWindowCompositingSupported() const override {
