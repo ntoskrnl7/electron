@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jung-Kang Lee <ntoskrnl7@gmail.com>
+Date: Fri, 20 Mar 2026 00:29:44 +0900
+Subject: fix: support NVIDIA VA-API native pixmap import
+
+
+diff --git a/gpu/ipc/service/gpu_init.cc b/gpu/ipc/service/gpu_init.cc
+index 05c976f1f037e45e963e20e2b4272339b1819350..6e71d9606415d7b26b1745ab713588af27d8fd01 100644
+--- a/gpu/ipc/service/gpu_init.cc
++++ b/gpu/ipc/service/gpu_init.cc
+@@ -806,23 +806,6 @@ bool GpuInit::InitializeAndStartSandbox(base::CommandLine* command_line,
+     }
+   }
+ 
+-#if BUILDFLAG(IS_OZONE)
+-  // We need to get supported formats before sandboxing to avoid an known
+-  // issue which breaks the camera preview. (b/166850715)
+-  {
+-    TRACE_EVENT("gpu,startup", "ui::ozone::IsFormatSupportedForTexturing");
+-    auto* surface_factory =
+-        ui::OzonePlatform::GetInstance()->GetSurfaceFactoryOzone();
+-    auto* gl_ozone = surface_factory->GetCurrentGLOzone();
+-    if (gl_ozone) {
+-      gpu_feature_info_.supports_nv12_gl_native_pixmap =
+-          gl_ozone->CanImportNativePixmap(viz::MultiPlaneFormat::kNV12);
+-      gpu_feature_info_.supports_p010_gl_native_pixmap =
+-          gl_ozone->CanImportNativePixmap(viz::MultiPlaneFormat::kP010);
+-    }
+-  }
+-#endif  // BUILDFLAG(IS_OZONE)
+-
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+   // Driver may create a compatibility profile context when collect graphics
+   // information on Linux platform. Try to collect graphics information
+@@ -845,6 +828,23 @@ bool GpuInit::InitializeAndStartSandbox(base::CommandLine* command_line,
+   }
+ #endif  // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+ 
++#if BUILDFLAG(IS_OZONE)
++  // We need to get supported formats before sandboxing to avoid an known
++  // issue which breaks the camera preview. (b/166850715)
++  {
++    TRACE_EVENT("gpu,startup", "ui::ozone::IsFormatSupportedForTexturing");
++    auto* surface_factory =
++        ui::OzonePlatform::GetInstance()->GetSurfaceFactoryOzone();
++    auto* gl_ozone = surface_factory->GetCurrentGLOzone();
++    if (gl_ozone) {
++      gpu_feature_info_.supports_nv12_gl_native_pixmap =
++          gl_ozone->CanImportNativePixmap(viz::MultiPlaneFormat::kNV12);
++      gpu_feature_info_.supports_p010_gl_native_pixmap =
++          gl_ozone->CanImportNativePixmap(viz::MultiPlaneFormat::kP010);
++    }
++  }
++#endif  // BUILDFLAG(IS_OZONE)
++
+   if (gl_use_swiftshader_) {
+     AdjustInfoToSwiftShader();
+   }
+diff --git a/media/gpu/vaapi/vaapi_wrapper.cc b/media/gpu/vaapi/vaapi_wrapper.cc
+index 4c220c3385e9eddb17e3d8281e5d546ab4fc6c6b..b0e16d511f36a08403eada4d85984359d6e779c8 100644
+--- a/media/gpu/vaapi/vaapi_wrapper.cc
++++ b/media/gpu/vaapi/vaapi_wrapper.cc
+@@ -385,6 +385,13 @@ media::VAImplementation VendorStringToImplementationType(
+   } else if (base::StartsWith(va_vendor_string, "Intel iHD driver",
+                               base::CompareCase::SENSITIVE)) {
+     return media::VAImplementation::kIntelIHD;
++  // The NVIDIA VA-API backend appears as either:
++  // - "VA-API NVDEC driver" (official)
++  // - "VA-API NVDEC/NVENC driver" (custom builds with NVENC support)
++  // Match the common NVDEC prefix so both map to kNvidia.
++  } else if (base::StartsWith(va_vendor_string, "VA-API NVDEC",
++                              base::CompareCase::SENSITIVE)) {
++    return media::VAImplementation::kNvidia;
+   } else if (base::StartsWith(va_vendor_string, "Chromium fake libva driver",
+                               base::CompareCase::SENSITIVE)) {
+     return media::VAImplementation::kChromiumFakeDriver;
+@@ -2450,6 +2457,7 @@ std::unique_ptr<ScopedVASurface> VaapiWrapper::CreateVASurfaceForPixmap(
+   // plumbed for JPEG decoding and encoding.
+   const bool use_drm_prime_2 =
+       (GetImplementationType() == VAImplementation::kIntelIHD ||
++       GetImplementationType() == VAImplementation::kNvidia ||
+        GetImplementationType() == VAImplementation::kChromiumFakeDriver ||
+        GetImplementationType() == VAImplementation::kMesaGallium) &&
+       !protected_content &&
+diff --git a/media/gpu/vaapi/vaapi_wrapper.h b/media/gpu/vaapi/vaapi_wrapper.h
+index 37001b947a9fa4355e42e99d527fb364bae8cb4b..a2be205da4f97458b791bd3d23bbf85cf7ae6d59 100644
+--- a/media/gpu/vaapi/vaapi_wrapper.h
++++ b/media/gpu/vaapi/vaapi_wrapper.h
+@@ -103,6 +103,7 @@ enum class VAImplementation {
+   kMesaGallium,
+   kIntelI965,
+   kIntelIHD,
++  kNvidia,
+   kChromiumFakeDriver,
+   kOther,
+   kInvalid,
